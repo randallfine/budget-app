@@ -1,7 +1,15 @@
 "use server";
 
+import { revalidatePath } from "next/cache";
 import { redirect, unstable_rethrow } from "next/navigation";
 import { isAllowedUserEmail } from "@/lib/supabase/allowed-users";
+import {
+  buildTransactionNotes,
+  findMatchingAccount,
+  findMatchingCategory,
+  matchesImportedTransaction,
+  normalizeImportedTransaction,
+} from "@/lib/imports/normalization";
 import { parseRocketMoneyCsv } from "@/lib/imports/rocket-money";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
@@ -73,7 +81,7 @@ async function getAuthorizedHouseholdId() {
     throw new Error("No household was found. Create a household before importing transactions.");
   }
 
-  return { adminSupabase, householdId: household.id };
+  return { adminSupabase, householdId: household.id, user };
 }
 
 async function getAuthorizedContext() {
@@ -226,5 +234,208 @@ export async function importRocketMoneyCsv(formData: FormData) {
       error instanceof Error ? sanitizeErrorMessage(error.message) : "Unexpected import error.";
 
     redirect(`/imports?error=import_failed&detail=${encodeURIComponent(detail)}`);
+  }
+}
+
+type ImportedTransactionForApproval = {
+  id: string;
+  household_id: string;
+  source: string;
+  external_id: string;
+  transaction_date: string;
+  account_type: string | null;
+  account_name: string | null;
+  institution_name: string | null;
+  merchant_name: string;
+  custom_name: string | null;
+  amount: number | string;
+  description: string | null;
+  category: string | null;
+  note: string | null;
+};
+
+type AccountRow = {
+  id: string;
+  name: string;
+  institution: string | null;
+  type: string;
+};
+
+type CategoryRow = {
+  id: string;
+  name: string;
+  kind: string;
+};
+
+type ExistingTransactionRow = {
+  id: string;
+  description: string | null;
+  notes: string | null;
+};
+
+async function deleteImportedTransaction(adminSupabase: ReturnType<typeof createAdminClient>, id: string) {
+  const { error } = await adminSupabase.from("imported_transactions").delete().eq("id", id);
+
+  if (error) {
+    throw error;
+  }
+}
+
+export async function approveImportedTransaction(formData: FormData) {
+  const importedTransactionId = formData.get("importedTransactionId");
+
+  if (typeof importedTransactionId !== "string" || !importedTransactionId.trim()) {
+    redirect("/imports?error=approval_failed&detail=Missing%20staged%20transaction%20id.");
+  }
+
+  try {
+    const { adminSupabase, householdId, user } = await getAuthorizedHouseholdId();
+    const { data: importedTransactionData, error: importedTransactionError } = await adminSupabase
+      .from("imported_transactions")
+      .select(
+        "id, household_id, source, external_id, transaction_date, account_type, account_name, institution_name, merchant_name, custom_name, amount, description, category, note",
+      )
+      .eq("household_id", householdId)
+      .eq("id", importedTransactionId)
+      .maybeSingle();
+
+    if (importedTransactionError) {
+      throw importedTransactionError;
+    }
+
+    const importedTransaction = importedTransactionData as ImportedTransactionForApproval | null;
+
+    if (!importedTransaction) {
+      redirect("/imports?error=approval_failed&detail=That%20staged%20transaction%20was%20not%20found.");
+    }
+
+    const normalized = normalizeImportedTransaction(importedTransaction);
+    const [{ data: accountData, error: accountsError }, { data: categoryData, error: categoriesError }] =
+      await Promise.all([
+        adminSupabase
+          .from("accounts")
+          .select("id, name, institution, type")
+          .eq("household_id", householdId),
+        adminSupabase
+          .from("categories")
+          .select("id, name, kind")
+          .eq("household_id", householdId),
+      ]);
+
+    if (accountsError) {
+      throw accountsError;
+    }
+
+    if (categoriesError) {
+      throw categoriesError;
+    }
+
+    const accounts = ((accountData ?? []) as AccountRow[]).slice();
+    const categories = ((categoryData ?? []) as CategoryRow[]).slice();
+
+    let account = findMatchingAccount(accounts, normalized);
+
+    if (!account) {
+      const { data: createdAccount, error: createAccountError } = await adminSupabase
+        .from("accounts")
+        .insert({
+          household_id: householdId,
+          name: normalized.accountName,
+          institution: normalized.institutionName,
+          type: normalized.accountType,
+          starting_balance: 0,
+        })
+        .select("id, name, institution, type")
+        .single();
+
+      if (createAccountError) {
+        throw createAccountError;
+      }
+
+      account = createdAccount as AccountRow;
+      accounts.push(account);
+    }
+
+    let category = findMatchingCategory(categories, normalized);
+
+    if (!category && normalized.categoryName) {
+      const { data: createdCategory, error: createCategoryError } = await adminSupabase
+        .from("categories")
+        .insert({
+          household_id: householdId,
+          name: normalized.categoryName,
+          kind: normalized.categoryKind,
+        })
+        .select("id, name, kind")
+        .single();
+
+      if (createCategoryError) {
+        throw createCategoryError;
+      }
+
+      category = createdCategory as CategoryRow;
+      categories.push(category);
+    }
+
+    const { data: existingTransactionData, error: existingTransactionsError } = await adminSupabase
+      .from("transactions")
+      .select("id, description, notes")
+      .eq("household_id", householdId)
+      .eq("account_id", account.id)
+      .eq("transaction_date", importedTransaction.transaction_date)
+      .eq("amount", importedTransaction.amount);
+
+    if (existingTransactionsError) {
+      throw existingTransactionsError;
+    }
+
+    const existingTransactions = (existingTransactionData ?? []) as ExistingTransactionRow[];
+    const isDuplicate = existingTransactions.some((transaction) =>
+      matchesImportedTransaction(
+        transaction,
+        normalized,
+        importedTransaction.source,
+        importedTransaction.external_id,
+      ),
+    );
+
+    if (isDuplicate) {
+      await deleteImportedTransaction(adminSupabase, importedTransaction.id);
+      revalidatePath("/imports");
+      revalidatePath("/transactions");
+      redirect("/imports?duplicate=1");
+    }
+
+    const { error: insertTransactionError } = await adminSupabase.from("transactions").insert({
+      household_id: householdId,
+      account_id: account.id,
+      category_id: category?.id ?? null,
+      amount: importedTransaction.amount,
+      transaction_date: importedTransaction.transaction_date,
+      description: normalized.transactionName,
+      notes: buildTransactionNotes(importedTransaction, normalized),
+      created_by: user.id,
+    });
+
+    if (insertTransactionError) {
+      throw insertTransactionError;
+    }
+
+    await deleteImportedTransaction(adminSupabase, importedTransaction.id);
+
+    revalidatePath("/imports");
+    revalidatePath("/transactions");
+    revalidatePath("/accounts");
+    revalidatePath("/categories");
+    revalidatePath("/dashboard");
+
+    redirect("/imports?approved=1");
+  } catch (error) {
+    unstable_rethrow(error);
+    console.error("Staged transaction approval failed:", error);
+    const detail =
+      error instanceof Error ? sanitizeErrorMessage(error.message) : "Unexpected approval error.";
+
+    redirect(`/imports?error=approval_failed&detail=${encodeURIComponent(detail)}`);
   }
 }

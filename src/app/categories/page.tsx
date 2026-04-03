@@ -16,7 +16,7 @@ type TransactionRow = {
 export default async function CategoriesPage() {
   const { adminSupabase, email, householdId } = await getAuthorizedPageContext();
   let categories: CategoryRow[] = [];
-  let transactionTotals = new Map<string, { spent: number; count: number }>();
+  const transactionTotals = new Map<string, { spent: number; count: number }>();
   let loadError = false;
 
   if (householdId) {

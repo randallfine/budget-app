@@ -1,22 +1,49 @@
 import { redirect } from "next/navigation";
+import {
+  findMatchingAccount,
+  findMatchingCategory,
+  normalizeImportedTransaction,
+} from "@/lib/imports/normalization";
 import { isAllowedUserEmail } from "@/lib/supabase/allowed-users";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 import { PageHeader } from "../(protected)/page-header";
-import { createDefaultHousehold, importRocketMoneyCsv } from "./actions";
+import {
+  approveImportedTransaction,
+  createDefaultHousehold,
+  importRocketMoneyCsv,
+} from "./actions";
+import { ApproveImportButton } from "./approve-import-button";
 import { ImportSubmitButton } from "./import-submit-button";
 
 type ImportedTransactionRow = {
   id: string;
+  external_id: string;
   transaction_date: string;
+  account_type: string | null;
   merchant_name: string;
   custom_name: string | null;
   amount: number | string;
+  description: string | null;
   category: string | null;
+  note: string | null;
   account_name: string | null;
   institution_name: string | null;
   source: string;
   created_at: string;
+};
+
+type AccountRow = {
+  id: string;
+  name: string;
+  institution: string | null;
+  type: string;
+};
+
+type CategoryRow = {
+  id: string;
+  name: string;
+  kind: string;
 };
 
 function isMissingImportedTransactionsTableError(error: unknown) {
@@ -52,6 +79,10 @@ const getErrorMessage = (error?: string, detail?: string) => {
         : "We couldn't create the default household.";
     case "missing_import_table":
       return "The imported_transactions table is missing in Supabase. Apply the pending database migration, then try the import again.";
+    case "approval_failed":
+      return detail
+        ? `Approval failed: ${detail}`
+        : "The staged transaction could not be approved.";
     default:
       return undefined;
   }
@@ -71,6 +102,8 @@ function normalizeAmount(value: number | string) {
 type ImportsPageProps = {
   searchParams?: Promise<{
     imported?: string;
+    approved?: string;
+    duplicate?: string;
     error?: string;
     detail?: string;
     household?: string;
@@ -99,6 +132,10 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
   const successMessage =
     Number.isFinite(importedCount) && importedCount > 0
       ? `Imported ${importedCount} Rocket Money transaction${importedCount === 1 ? "" : "s"}.`
+      : resolvedSearchParams?.approved === "1"
+        ? "Approved the staged transaction and moved it into Transactions."
+        : resolvedSearchParams?.duplicate === "1"
+          ? "That staged transaction already existed in Transactions, so it was skipped and removed from staging."
       : undefined;
   const householdMessage =
     resolvedSearchParams?.household === "created"
@@ -112,6 +149,8 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
   );
   const adminSupabase = createAdminClient();
   let importedTransactions: ImportedTransactionRow[] = [];
+  let accounts: AccountRow[] = [];
+  let categories: CategoryRow[] = [];
   let loadError = false;
   let loadErrorMessage: string | undefined;
   let hasHousehold = false;
@@ -131,21 +170,45 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
 
     if (household) {
       hasHousehold = true;
-      const { data, error } = await adminSupabase
-        .from("imported_transactions")
-        .select(
-          "id, transaction_date, merchant_name, custom_name, amount, category, account_name, institution_name, source, created_at",
-        )
-        .eq("household_id", household.id)
-        .order("transaction_date", { ascending: false })
-        .order("created_at", { ascending: false })
-        .limit(25);
+      const [
+        { data: importedData, error: importedError },
+        { data: accountData, error: accountError },
+        { data: categoryData, error: categoryError },
+      ] = await Promise.all([
+        adminSupabase
+          .from("imported_transactions")
+          .select(
+            "id, external_id, transaction_date, account_type, merchant_name, custom_name, amount, description, category, note, account_name, institution_name, source, created_at",
+          )
+          .eq("household_id", household.id)
+          .order("transaction_date", { ascending: false })
+          .order("created_at", { ascending: false })
+          .limit(25),
+        adminSupabase
+          .from("accounts")
+          .select("id, name, institution, type")
+          .eq("household_id", household.id),
+        adminSupabase
+          .from("categories")
+          .select("id, name, kind")
+          .eq("household_id", household.id),
+      ]);
 
-      if (error) {
-        throw error;
+      if (importedError) {
+        throw importedError;
       }
 
-      importedTransactions = (data ?? []) as ImportedTransactionRow[];
+      if (accountError) {
+        throw accountError;
+      }
+
+      if (categoryError) {
+        throw categoryError;
+      }
+
+      importedTransactions = (importedData ?? []) as ImportedTransactionRow[];
+      accounts = (accountData ?? []) as AccountRow[];
+      categories = (categoryData ?? []) as CategoryRow[];
     }
   } catch (error) {
     loadError = true;
@@ -280,21 +343,38 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
               <thead className="bg-zinc-50 dark:bg-zinc-900/60">
                 <tr>
                   <th className="px-4 py-3 font-medium">Date</th>
-                  <th className="px-4 py-3 font-medium">Merchant</th>
+                  <th className="px-4 py-3 font-medium">Normalized Transaction</th>
                   <th className="px-4 py-3 font-medium">Account</th>
                   <th className="px-4 py-3 font-medium">Category</th>
+                  <th className="px-4 py-3 font-medium">Type</th>
                   <th className="px-4 py-3 font-medium">Source</th>
                   <th className="px-4 py-3 font-medium">Amount</th>
+                  <th className="px-4 py-3 font-medium text-right">Approve</th>
                 </tr>
               </thead>
               <tbody>
                 {importedTransactions.map((transaction) => {
                   const amount = normalizeAmount(transaction.amount);
-                  const displayName =
+                  const normalized = normalizeImportedTransaction(transaction);
+                  const accountMatch = findMatchingAccount(accounts, normalized);
+                  const categoryMatch = findMatchingCategory(categories, normalized);
+                  const rawDisplayName =
                     transaction.custom_name?.trim() || transaction.merchant_name;
-                  const accountLabel = [transaction.institution_name, transaction.account_name]
+                  const accountLabel = [
+                    normalized.institutionName,
+                    normalized.accountName,
+                  ]
                     .filter(Boolean)
                     .join(" • ");
+                  const categoryLabel = normalized.categoryName ?? "Uncategorized";
+                  const accountStatus = accountMatch
+                    ? "Matches existing account"
+                    : "Creates account on approval";
+                  const categoryStatus = normalized.categoryName
+                    ? categoryMatch
+                      ? "Matches existing category"
+                      : "Creates category on approval"
+                    : "Leaves transaction uncategorized";
 
                   return (
                     <tr
@@ -306,19 +386,31 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
                       </td>
                       <td className="px-4 py-3">
                         <div>
-                          <p className="font-medium">{displayName}</p>
-                          {transaction.custom_name ? (
+                          <p className="font-medium">{normalized.transactionName}</p>
+                          <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                            Raw: {rawDisplayName}
+                          </p>
+                          {transaction.description ? (
                             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                              Original: {transaction.merchant_name}
+                              Memo: {transaction.description}
                             </p>
                           ) : null}
                         </div>
                       </td>
-                      <td className="px-4 py-3 text-zinc-600 dark:text-zinc-400">
-                        {accountLabel || "—"}
+                      <td className="px-4 py-3">
+                        <p className="text-zinc-600 dark:text-zinc-400">{accountLabel || "—"}</p>
+                        <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                          {accountStatus}
+                        </p>
                       </td>
-                      <td className="px-4 py-3 text-zinc-600 dark:text-zinc-400">
-                        {transaction.category ?? "—"}
+                      <td className="px-4 py-3">
+                        <p className="text-zinc-600 dark:text-zinc-400">{categoryLabel}</p>
+                        <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                          {categoryStatus}
+                        </p>
+                      </td>
+                      <td className="px-4 py-3 text-zinc-600 capitalize dark:text-zinc-400">
+                        {normalized.transactionType}
                       </td>
                       <td className="px-4 py-3 text-zinc-600 dark:text-zinc-400">
                         {transaction.source}
@@ -333,6 +425,16 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
                         >
                           {formatCurrency(amount)}
                         </span>
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <form action={approveImportedTransaction}>
+                          <input
+                            type="hidden"
+                            name="importedTransactionId"
+                            value={transaction.id}
+                          />
+                          <ApproveImportButton />
+                        </form>
                       </td>
                     </tr>
                   );
