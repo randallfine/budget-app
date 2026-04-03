@@ -4,11 +4,13 @@ import { revalidatePath } from "next/cache";
 import { redirect, unstable_rethrow } from "next/navigation";
 import { isAllowedUserEmail } from "@/lib/supabase/allowed-users";
 import {
+  buildReadableImportedAccountName,
   buildTransactionNotes,
   findMatchingAccount,
   findMatchingCategory,
   matchesImportedTransaction,
   normalizeImportedTransaction,
+  requiresTransactionNameReview,
 } from "@/lib/imports/normalization";
 import { parseRocketMoneyCsv } from "@/lib/imports/rocket-money";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -245,6 +247,7 @@ type ImportedTransactionForApproval = {
   transaction_date: string;
   account_type: string | null;
   account_name: string | null;
+  account_number: string | null;
   institution_name: string | null;
   merchant_name: string;
   custom_name: string | null;
@@ -293,7 +296,7 @@ export async function approveImportedTransaction(formData: FormData) {
     const { data: importedTransactionData, error: importedTransactionError } = await adminSupabase
       .from("imported_transactions")
       .select(
-        "id, household_id, source, external_id, transaction_date, account_type, account_name, institution_name, merchant_name, custom_name, amount, description, category, note",
+        "id, household_id, source, external_id, transaction_date, account_type, account_name, account_number, institution_name, merchant_name, custom_name, amount, description, category, note",
       )
       .eq("household_id", householdId)
       .eq("id", importedTransactionId)
@@ -309,8 +312,18 @@ export async function approveImportedTransaction(formData: FormData) {
       redirect("/imports?error=approval_failed&detail=That%20staged%20transaction%20was%20not%20found.");
     }
 
+    if (requiresTransactionNameReview(importedTransaction)) {
+      redirect(
+        "/imports?error=approval_failed&detail=Please%20validate%20the%20transaction%20name%20mapping%20before%20approval.",
+      );
+    }
+
     const normalized = normalizeImportedTransaction(importedTransaction);
-    const [{ data: accountData, error: accountsError }, { data: categoryData, error: categoriesError }] =
+    const [
+      { data: accountData, error: accountsError },
+      { data: categoryData, error: categoriesError },
+      { data: similarImportedData, error: similarImportedError },
+    ] =
       await Promise.all([
         adminSupabase
           .from("accounts")
@@ -320,6 +333,15 @@ export async function approveImportedTransaction(formData: FormData) {
           .from("categories")
           .select("id, name, kind")
           .eq("household_id", householdId),
+        adminSupabase
+          .from("imported_transactions")
+          .select(
+            "source, external_id, amount, merchant_name, custom_name, description, category, note, institution_name, account_name, account_number, account_type",
+          )
+          .eq("household_id", householdId)
+          .eq("institution_name", importedTransaction.institution_name)
+          .eq("account_name", importedTransaction.account_name)
+          .eq("account_type", importedTransaction.account_type),
       ]);
 
     if (accountsError) {
@@ -330,8 +352,19 @@ export async function approveImportedTransaction(formData: FormData) {
       throw categoriesError;
     }
 
+    if (similarImportedError) {
+      throw similarImportedError;
+    }
+
     const accounts = ((accountData ?? []) as AccountRow[]).slice();
     const categories = ((categoryData ?? []) as CategoryRow[]).slice();
+    const similarImportedTransactions =
+      ((similarImportedData ?? []) as ImportedTransactionForApproval[]) ?? [];
+    const readableAccountName = buildReadableImportedAccountName(
+      normalized,
+      similarImportedTransactions,
+      accounts,
+    );
 
     let account = findMatchingAccount(accounts, normalized);
 
@@ -340,7 +373,7 @@ export async function approveImportedTransaction(formData: FormData) {
         .from("accounts")
         .insert({
           household_id: householdId,
-          name: normalized.accountName,
+          name: readableAccountName,
           institution: normalized.institutionName,
           type: normalized.accountType,
           starting_balance: 0,
@@ -435,6 +468,46 @@ export async function approveImportedTransaction(formData: FormData) {
     console.error("Staged transaction approval failed:", error);
     const detail =
       error instanceof Error ? sanitizeErrorMessage(error.message) : "Unexpected approval error.";
+
+    redirect(`/imports?error=approval_failed&detail=${encodeURIComponent(detail)}`);
+  }
+}
+
+export async function saveImportedTransactionNameReview(formData: FormData) {
+  const importedTransactionId = formData.get("importedTransactionId");
+  const reviewedName = formData.get("reviewedName");
+
+  if (typeof importedTransactionId !== "string" || !importedTransactionId.trim()) {
+    redirect("/imports?error=approval_failed&detail=Missing%20staged%20transaction%20id.");
+  }
+
+  if (typeof reviewedName !== "string" || !reviewedName.trim()) {
+    redirect(
+      "/imports?error=approval_failed&detail=Enter%20the%20transaction%20name%20you%20want%20to%20use.",
+    );
+  }
+
+  try {
+    const { adminSupabase, householdId } = await getAuthorizedHouseholdId();
+    const { error } = await adminSupabase
+      .from("imported_transactions")
+      .update({
+        custom_name: reviewedName.trim(),
+      })
+      .eq("household_id", householdId)
+      .eq("id", importedTransactionId);
+
+    if (error) {
+      throw error;
+    }
+
+    revalidatePath("/imports");
+    redirect("/imports?name_reviewed=1");
+  } catch (error) {
+    unstable_rethrow(error);
+    console.error("Imported transaction name review failed:", error);
+    const detail =
+      error instanceof Error ? sanitizeErrorMessage(error.message) : "Unexpected review error.";
 
     redirect(`/imports?error=approval_failed&detail=${encodeURIComponent(detail)}`);
   }

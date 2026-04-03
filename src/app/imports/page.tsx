@@ -1,9 +1,13 @@
 import { redirect } from "next/navigation";
 import {
+  buildReadableImportedAccountName,
+  formatImportedDisplayLabel,
   findMatchingAccount,
   findMatchingCategory,
   normalizeImportedTransaction,
+  requiresTransactionNameReview,
 } from "@/lib/imports/normalization";
+import { findRecurringCandidates } from "@/lib/imports/recurrence";
 import { isAllowedUserEmail } from "@/lib/supabase/allowed-users";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
@@ -12,15 +16,18 @@ import {
   approveImportedTransaction,
   createDefaultHousehold,
   importRocketMoneyCsv,
+  saveImportedTransactionNameReview,
 } from "./actions";
 import { ApproveImportButton } from "./approve-import-button";
 import { ImportSubmitButton } from "./import-submit-button";
+import { SaveReviewButton } from "./save-review-button";
 
 type ImportedTransactionRow = {
   id: string;
   external_id: string;
   transaction_date: string;
   account_type: string | null;
+  account_number: string | null;
   merchant_name: string;
   custom_name: string | null;
   amount: number | string;
@@ -104,6 +111,7 @@ type ImportsPageProps = {
     imported?: string;
     approved?: string;
     duplicate?: string;
+    name_reviewed?: string;
     error?: string;
     detail?: string;
     household?: string;
@@ -136,6 +144,8 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
         ? "Approved the staged transaction and moved it into Transactions."
         : resolvedSearchParams?.duplicate === "1"
           ? "That staged transaction already existed in Transactions, so it was skipped and removed from staging."
+          : resolvedSearchParams?.name_reviewed === "1"
+            ? "Saved the reviewed transaction name."
       : undefined;
   const householdMessage =
     resolvedSearchParams?.household === "created"
@@ -151,6 +161,7 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
   let importedTransactions: ImportedTransactionRow[] = [];
   let accounts: AccountRow[] = [];
   let categories: CategoryRow[] = [];
+  let recurringCandidates: ReturnType<typeof findRecurringCandidates> = [];
   let loadError = false;
   let loadErrorMessage: string | undefined;
   let hasHousehold = false;
@@ -178,12 +189,12 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
         adminSupabase
           .from("imported_transactions")
           .select(
-            "id, external_id, transaction_date, account_type, merchant_name, custom_name, amount, description, category, note, account_name, institution_name, source, created_at",
+            "id, external_id, transaction_date, account_type, account_number, merchant_name, custom_name, amount, description, category, note, account_name, institution_name, source, created_at",
           )
           .eq("household_id", household.id)
           .order("transaction_date", { ascending: false })
           .order("created_at", { ascending: false })
-          .limit(25),
+          .limit(250),
         adminSupabase
           .from("accounts")
           .select("id, name, institution, type")
@@ -209,6 +220,8 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
       importedTransactions = (importedData ?? []) as ImportedTransactionRow[];
       accounts = (accountData ?? []) as AccountRow[];
       categories = (categoryData ?? []) as CategoryRow[];
+      recurringCandidates = findRecurringCandidates(importedTransactions, accounts);
+      importedTransactions = importedTransactions.slice(0, 25);
     }
   } catch (error) {
     loadError = true;
@@ -356,13 +369,25 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
                 {importedTransactions.map((transaction) => {
                   const amount = normalizeAmount(transaction.amount);
                   const normalized = normalizeImportedTransaction(transaction);
+                  const needsNameReview = requiresTransactionNameReview(transaction);
+                  const similarImportedTransactions = importedTransactions.filter(
+                    (candidate) =>
+                      candidate.institution_name === transaction.institution_name &&
+                      candidate.account_name === transaction.account_name &&
+                      candidate.account_type === transaction.account_type,
+                  );
+                  const readableAccountName = buildReadableImportedAccountName(
+                    normalized,
+                    similarImportedTransactions,
+                    accounts,
+                  );
                   const accountMatch = findMatchingAccount(accounts, normalized);
                   const categoryMatch = findMatchingCategory(categories, normalized);
                   const rawDisplayName =
                     transaction.custom_name?.trim() || transaction.merchant_name;
                   const accountLabel = [
                     normalized.institutionName,
-                    normalized.accountName,
+                    readableAccountName,
                   ]
                     .filter(Boolean)
                     .join(" • ");
@@ -375,6 +400,8 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
                       ? "Matches existing category"
                       : "Creates category on approval"
                     : "Leaves transaction uncategorized";
+                  const reviewedNameValue =
+                    transaction.custom_name?.trim() || normalized.transactionName;
 
                   return (
                     <tr
@@ -388,12 +415,36 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
                         <div>
                           <p className="font-medium">{normalized.transactionName}</p>
                           <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                            Raw: {rawDisplayName}
+                            Raw: {formatImportedDisplayLabel(rawDisplayName)}
                           </p>
                           {transaction.description ? (
                             <p className="text-xs text-zinc-500 dark:text-zinc-400">
                               Memo: {transaction.description}
                             </p>
+                          ) : null}
+                          {needsNameReview ? (
+                            <div className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+                              Please validate this transaction name mapping before approval.
+                            </div>
+                          ) : null}
+                          {needsNameReview ? (
+                            <form
+                              action={saveImportedTransactionNameReview}
+                              className="mt-2 flex flex-wrap items-center gap-2"
+                            >
+                              <input
+                                type="hidden"
+                                name="importedTransactionId"
+                                value={transaction.id}
+                              />
+                              <input
+                                type="text"
+                                name="reviewedName"
+                                defaultValue={reviewedNameValue}
+                                className="min-w-56 flex-1 rounded-md border border-zinc-300 bg-white px-3 py-2 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                              />
+                              <SaveReviewButton />
+                            </form>
                           ) : null}
                         </div>
                       </td>
@@ -435,6 +486,11 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
                           />
                           <ApproveImportButton />
                         </form>
+                        {needsNameReview ? (
+                          <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                            Approval is blocked until the name is reviewed.
+                          </p>
+                        ) : null}
                       </td>
                     </tr>
                   );
@@ -443,6 +499,98 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
             </table>
           </div>
         ) : null}
+      </section>
+
+      <section className="mt-6 rounded-xl border border-zinc-200 p-6 dark:border-zinc-800">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-semibold">Recurring Candidates</h2>
+            <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+              Repeating staged transactions inferred from up to 250 imported rows.
+            </p>
+          </div>
+          <div className="text-right">
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">Detected patterns</p>
+            <p className="font-mono text-sm">{recurringCandidates.length}</p>
+          </div>
+        </div>
+
+        {loadError ? null : recurringCandidates.length === 0 ? (
+          <p className="mt-4 text-sm text-zinc-600 dark:text-zinc-400">
+            No recurring patterns were detected yet. This usually means there are not enough repeated staged transactions, or the timing and amounts vary too much to infer a schedule confidently.
+          </p>
+        ) : (
+          <div className="mt-4 overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-zinc-50 dark:bg-zinc-900/60">
+                <tr>
+                  <th className="px-4 py-3 font-medium">Transaction</th>
+                  <th className="px-4 py-3 font-medium">Account</th>
+                  <th className="px-4 py-3 font-medium">Amount</th>
+                  <th className="px-4 py-3 font-medium">Repeats</th>
+                  <th className="px-4 py-3 font-medium">Next Due</th>
+                  <th className="px-4 py-3 font-medium">Payoff / End</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recurringCandidates.map((candidate) => (
+                  <tr
+                    key={candidate.key}
+                    className="border-t border-zinc-200 dark:border-zinc-800"
+                  >
+                    <td className="px-4 py-3">
+                      <p className="font-medium">{candidate.name}</p>
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                        Seen {candidate.occurrences} times from {candidate.firstSeenDate} to{" "}
+                        {candidate.lastSeenDate}
+                      </p>
+                    </td>
+                    <td className="px-4 py-3 text-zinc-600 dark:text-zinc-400">
+                      {candidate.accountLabel}
+                    </td>
+                    <td className="px-4 py-3 font-mono">
+                      {formatCurrency(candidate.amount)}
+                    </td>
+                    <td className="px-4 py-3">
+                      <p className="text-zinc-600 dark:text-zinc-400">
+                        {candidate.cadenceLabel}
+                      </p>
+                      <p className="text-xs text-zinc-500 capitalize dark:text-zinc-400">
+                        {candidate.confidence} confidence
+                      </p>
+                    </td>
+                    <td className="px-4 py-3 text-zinc-600 dark:text-zinc-400">
+                      {candidate.nextExpectedDate ?? "Unknown"}
+                    </td>
+                    <td className="px-4 py-3">
+                      {candidate.remainingPayments !== null ? (
+                        <>
+                          <p className="text-zinc-600 dark:text-zinc-400">
+                            {candidate.remainingPayments} payment
+                            {candidate.remainingPayments === 1 ? "" : "s"} left
+                          </p>
+                          <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                            {candidate.paymentsCompleted}/{candidate.totalPayments} completed
+                            {candidate.endDate ? ` • Est. end ${candidate.endDate}` : ""}
+                          </p>
+                        </>
+                      ) : (
+                        <p className="text-zinc-500 dark:text-zinc-400">
+                          No payoff estimate in imported data
+                        </p>
+                      )}
+                      {candidate.needsValidation ? (
+                        <p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+                          {candidate.validationReason}
+                        </p>
+                      ) : null}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
     </main>
   );

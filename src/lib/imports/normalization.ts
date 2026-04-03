@@ -9,6 +9,7 @@ type ImportedTransactionLike = {
   note: string | null;
   institution_name: string | null;
   account_name: string | null;
+  account_number?: string | null;
   account_type: string | null;
 };
 
@@ -96,6 +97,10 @@ function cleanDisplayLabel(value: string) {
   return titleCaseLabel(normalized);
 }
 
+export function formatImportedDisplayLabel(value: string) {
+  return cleanDisplayLabel(value);
+}
+
 function cleanTransactionName(value: string) {
   let cleaned = normalizeWhitespace(
     value
@@ -120,6 +125,21 @@ function cleanTransactionName(value: string) {
   cleaned = normalizeWhitespace(cleaned);
 
   return cleanDisplayLabel(cleaned);
+}
+
+function normalizeAccountNumber(value: string | null | undefined) {
+  const digits = (value ?? "").replace(/\D+/g, "");
+  return digits || null;
+}
+
+function getAccountNumberSuffix(value: string | null | undefined) {
+  const digits = normalizeAccountNumber(value);
+
+  if (!digits) {
+    return null;
+  }
+
+  return digits.slice(-4);
 }
 
 export function canonicalizeForMatch(value: string | null | undefined) {
@@ -224,6 +244,7 @@ export function normalizeImportedTransaction(transaction: ImportedTransactionLik
   const accountName = transaction.account_name
     ? cleanDisplayLabel(transaction.account_name)
     : "Imported Account";
+  const accountNumberSuffix = getAccountNumberSuffix(transaction.account_number);
   const accountType = normalizeAccountType(transaction.account_type);
   const categoryName = transaction.category ? cleanDisplayLabel(transaction.category) : null;
   const transactionType = inferTransactionType(transaction);
@@ -233,6 +254,7 @@ export function normalizeImportedTransaction(transaction: ImportedTransactionLik
     transactionName,
     institutionName,
     accountName,
+    accountNumberSuffix,
     accountType,
     categoryName,
     categoryKind,
@@ -241,23 +263,132 @@ export function normalizeImportedTransaction(transaction: ImportedTransactionLik
   };
 }
 
+export function requiresTransactionNameReview(transaction: ImportedTransactionLike) {
+  if (transaction.custom_name?.trim()) {
+    return false;
+  }
+
+  const normalized = normalizeImportedTransaction(transaction);
+  const rawDisplayName = formatImportedDisplayLabel(
+    transaction.merchant_name || transaction.description || "Imported transaction",
+  );
+
+  if (canonicalizeForMatch(normalized.transactionName) !== canonicalizeForMatch(rawDisplayName)) {
+    return true;
+  }
+
+  return /[*#]\w|\d{5,}|autopay|payment|interest charge|returned ach/i.test(
+    transaction.merchant_name,
+  );
+}
+
+function splitDisambiguatedAccountName(value: string | null | undefined) {
+  const label = normalizeWhitespace(value ?? "");
+  const match = label.match(/^(.*?)(?:\s+•\s+(\d{4}))$/);
+
+  if (!match) {
+    return {
+      baseName: label,
+      suffix: null as string | null,
+    };
+  }
+
+  return {
+    baseName: normalizeWhitespace(match[1] ?? ""),
+    suffix: match[2] ?? null,
+  };
+}
+
+function buildAccountIdentityKey(
+  institutionName: string | null | undefined,
+  accountName: string | null | undefined,
+  accountType: string | null | undefined,
+) {
+  return [
+    canonicalizeForMatch(institutionName),
+    canonicalizeForMatch(accountName),
+    canonicalizeForMatch(accountType),
+  ].join(":");
+}
+
+export function buildReadableImportedAccountName(
+  normalized: ReturnType<typeof normalizeImportedTransaction>,
+  similarImportedTransactions: ImportedTransactionLike[],
+  existingAccounts: AccountLike[] = [],
+) {
+  const importedIdentityCounts = new Map<string, Set<string>>();
+
+  for (const transaction of similarImportedTransactions) {
+    const candidate = normalizeImportedTransaction(transaction);
+    const key = buildAccountIdentityKey(
+      candidate.institutionName,
+      candidate.accountName,
+      candidate.accountType,
+    );
+    const suffixes = importedIdentityCounts.get(key) ?? new Set<string>();
+
+    if (candidate.accountNumberSuffix) {
+      suffixes.add(candidate.accountNumberSuffix);
+    }
+
+    importedIdentityCounts.set(key, suffixes);
+  }
+
+  for (const account of existingAccounts) {
+    const { baseName, suffix } = splitDisambiguatedAccountName(account.name);
+    const key = buildAccountIdentityKey(
+      account.institution,
+      baseName,
+      normalizeAccountType(account.type),
+    );
+    const suffixes = importedIdentityCounts.get(key) ?? new Set<string>();
+
+    if (suffix) {
+      suffixes.add(suffix);
+    }
+
+    importedIdentityCounts.set(key, suffixes);
+  }
+
+  const currentKey = buildAccountIdentityKey(
+    normalized.institutionName,
+    normalized.accountName,
+    normalized.accountType,
+  );
+  const distinctSuffixes = importedIdentityCounts.get(currentKey) ?? new Set<string>();
+  const shouldDisambiguate =
+    Boolean(normalized.accountNumberSuffix) && distinctSuffixes.size > 1;
+
+  if (!shouldDisambiguate) {
+    return normalized.accountName;
+  }
+
+  return `${normalized.accountName} • ${normalized.accountNumberSuffix}`;
+}
+
 export function findMatchingAccount(
   accounts: AccountLike[],
   normalized: ReturnType<typeof normalizeImportedTransaction>,
 ) {
   const targetName = canonicalizeForMatch(normalized.accountName);
+  const targetSuffix = normalized.accountNumberSuffix;
   const targetInstitution = canonicalizeForMatch(normalized.institutionName);
 
   return (
     accounts.find((account) => {
-      const sameName = canonicalizeForMatch(account.name) === targetName;
+      const { baseName, suffix } = splitDisambiguatedAccountName(account.name);
+      const sameName = canonicalizeForMatch(baseName) === targetName;
       const sameInstitution =
         canonicalizeForMatch(account.institution) === targetInstitution;
       const sameType = normalizeAccountType(account.type) === normalized.accountType;
+      const sameSuffix = targetSuffix ? suffix === targetSuffix : true;
 
-      return sameName && sameInstitution && sameType;
+      return sameName && sameInstitution && sameType && sameSuffix;
     }) ??
-    accounts.find((account) => canonicalizeForMatch(account.name) === targetName) ??
+    accounts.find((account) => {
+      const { baseName } = splitDisambiguatedAccountName(account.name);
+      return canonicalizeForMatch(baseName) === targetName;
+    }) ??
     null
   );
 }
