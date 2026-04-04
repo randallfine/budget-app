@@ -6,6 +6,7 @@ import {
   findMatchingCategory,
   normalizeImportedTransaction,
   requiresTransactionNameReview,
+  transactionTypeOptions,
 } from "@/lib/imports/normalization";
 import { findRecurringCandidates } from "@/lib/imports/recurrence";
 import { isAllowedUserEmail } from "@/lib/supabase/allowed-users";
@@ -13,14 +14,17 @@ import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 import { PageHeader } from "../(protected)/page-header";
 import {
+  approveImportedTransactionsBatch,
   approveImportedTransaction,
   createDefaultHousehold,
   importRocketMoneyCsv,
   saveImportedTransactionNameReview,
+  saveImportedTransactionTypeReview,
 } from "./actions";
-import { ApproveImportButton } from "./approve-import-button";
+import { BatchApproveButton } from "./batch-approve-button";
 import { ImportSubmitButton } from "./import-submit-button";
 import { SaveReviewButton } from "./save-review-button";
+import { SaveTypeButton } from "./save-type-button";
 
 type ImportedTransactionRow = {
   id: string;
@@ -30,6 +34,7 @@ type ImportedTransactionRow = {
   account_number: string | null;
   merchant_name: string;
   custom_name: string | null;
+  reviewed_transaction_type: string | null;
   amount: number | string;
   description: string | null;
   category: string | null;
@@ -111,7 +116,11 @@ type ImportsPageProps = {
     imported?: string;
     approved?: string;
     duplicate?: string;
+    batch_approved?: string;
+    batch_duplicates?: string;
+    batch_review?: string;
     name_reviewed?: string;
+    type_reviewed?: string;
     error?: string;
     detail?: string;
     household?: string;
@@ -137,15 +146,24 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
 
   const resolvedSearchParams = searchParams ? await searchParams : undefined;
   const importedCount = Number.parseInt(resolvedSearchParams?.imported ?? "", 10);
+  const batchApprovedCount = Number.parseInt(resolvedSearchParams?.batch_approved ?? "", 10);
+  const batchDuplicateCount = Number.parseInt(resolvedSearchParams?.batch_duplicates ?? "", 10);
+  const batchReviewCount = Number.parseInt(resolvedSearchParams?.batch_review ?? "", 10);
   const successMessage =
     Number.isFinite(importedCount) && importedCount > 0
       ? `Imported ${importedCount} Rocket Money transaction${importedCount === 1 ? "" : "s"}.`
+      : Number.isFinite(batchApprovedCount) ||
+          Number.isFinite(batchDuplicateCount) ||
+          Number.isFinite(batchReviewCount)
+        ? `Batch approval finished: ${Number.isFinite(batchApprovedCount) ? batchApprovedCount : 0} approved, ${Number.isFinite(batchDuplicateCount) ? batchDuplicateCount : 0} duplicates removed, ${Number.isFinite(batchReviewCount) ? batchReviewCount : 0} still need review.`
       : resolvedSearchParams?.approved === "1"
         ? "Approved the staged transaction and moved it into Transactions."
         : resolvedSearchParams?.duplicate === "1"
           ? "That staged transaction already existed in Transactions, so it was skipped and removed from staging."
           : resolvedSearchParams?.name_reviewed === "1"
             ? "Saved the reviewed transaction name."
+            : resolvedSearchParams?.type_reviewed === "1"
+              ? "Saved the reviewed transaction type."
       : undefined;
   const householdMessage =
     resolvedSearchParams?.household === "created"
@@ -166,6 +184,7 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
   let loadErrorMessage: string | undefined;
   let hasHousehold = false;
   let importsTableMissing = false;
+  const batchFormId = "batch-import-approval-form";
 
   try {
     const { data: household, error: householdError } = await adminSupabase
@@ -189,7 +208,7 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
         adminSupabase
           .from("imported_transactions")
           .select(
-            "id, external_id, transaction_date, account_type, account_number, merchant_name, custom_name, amount, description, category, note, account_name, institution_name, source, created_at",
+            "id, external_id, transaction_date, account_type, account_number, merchant_name, custom_name, reviewed_transaction_type, amount, description, category, note, account_name, institution_name, source, created_at",
           )
           .eq("household_id", household.id)
           .order("transaction_date", { ascending: false })
@@ -352,9 +371,17 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
 
         {!loadError && importedTransactions.length > 0 ? (
           <div className="mt-4 overflow-x-auto">
+            <form id={batchFormId} action={approveImportedTransactionsBatch} className="mb-3 flex items-center justify-between gap-3">
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                Select staged rows with the checkboxes, then approve them together.
+              </p>
+              <BatchApproveButton />
+            </form>
+
             <table className="w-full text-left text-sm">
               <thead className="bg-zinc-50 dark:bg-zinc-900/60">
                 <tr>
+                  <th className="px-4 py-3 font-medium">Select</th>
                   <th className="px-4 py-3 font-medium">Date</th>
                   <th className="px-4 py-3 font-medium">Normalized Transaction</th>
                   <th className="px-4 py-3 font-medium">Account</th>
@@ -408,6 +435,16 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
                       key={transaction.id}
                       className="border-t border-zinc-200 dark:border-zinc-800"
                     >
+                      <td className="px-4 py-3 align-top">
+                        <input
+                          type="checkbox"
+                          name="importedTransactionIds"
+                          value={transaction.id}
+                          form={batchFormId}
+                          disabled={needsNameReview}
+                          className="h-4 w-4 rounded border-zinc-300 text-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
+                        />
+                      </td>
                       <td className="px-4 py-3 text-zinc-600 dark:text-zinc-400">
                         {transaction.transaction_date}
                       </td>
@@ -461,7 +498,31 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
                         </p>
                       </td>
                       <td className="px-4 py-3 text-zinc-600 capitalize dark:text-zinc-400">
-                        {normalized.transactionType}
+                        <div className="space-y-2">
+                          <p>{normalized.transactionType}</p>
+                          <form
+                            action={saveImportedTransactionTypeReview}
+                            className="flex flex-wrap items-center gap-2"
+                          >
+                            <input
+                              type="hidden"
+                              name="importedTransactionId"
+                              value={transaction.id}
+                            />
+                            <select
+                              name="reviewedTransactionType"
+                              defaultValue={normalized.transactionType}
+                              className="rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                            >
+                              {transactionTypeOptions.map((option) => (
+                                <option key={option} value={option}>
+                                  {option}
+                                </option>
+                              ))}
+                            </select>
+                            <SaveTypeButton />
+                          </form>
+                        </div>
                       </td>
                       <td className="px-4 py-3 text-zinc-600 dark:text-zinc-400">
                         {transaction.source}
@@ -479,12 +540,15 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
                       </td>
                       <td className="px-4 py-3 text-right">
                         <form action={approveImportedTransaction}>
-                          <input
-                            type="hidden"
+                          <button
+                            type="submit"
                             name="importedTransactionId"
                             value={transaction.id}
-                          />
-                          <ApproveImportButton />
+                            disabled={needsNameReview}
+                            className="rounded-md bg-emerald-600 px-3 py-2 text-xs font-medium text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-emerald-400"
+                          >
+                            Approve
+                          </button>
                         </form>
                         {needsNameReview ? (
                           <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">

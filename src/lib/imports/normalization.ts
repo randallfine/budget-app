@@ -11,7 +11,20 @@ type ImportedTransactionLike = {
   account_name: string | null;
   account_number?: string | null;
   account_type: string | null;
+  reviewed_transaction_type?: string | null;
 };
+
+export const transactionTypeOptions = [
+  "debit",
+  "deposit",
+  "transfer",
+  "credit",
+  "refund",
+  "fee",
+  "withdrawal",
+] as const;
+
+export type TransactionTypeOption = (typeof transactionTypeOptions)[number];
 
 type AccountLike = {
   id: string;
@@ -183,16 +196,34 @@ export function normalizeAccountType(value: string | null | undefined) {
 }
 
 export function inferTransactionType(transaction: ImportedTransactionLike) {
+  const reviewedType = normalizeWhitespace(transaction.reviewed_transaction_type ?? "").toLowerCase();
+
+  if (
+    reviewedType &&
+    transactionTypeOptions.includes(reviewedType as TransactionTypeOption)
+  ) {
+    return reviewedType as TransactionTypeOption;
+  }
+
   const amount = toNumber(transaction.amount);
   const searchable = [
     transaction.category,
     transaction.description,
     transaction.custom_name,
     transaction.merchant_name,
+    transaction.note,
   ]
     .filter(Boolean)
     .join(" ")
     .toLowerCase();
+
+  if (
+    /(internal transfer|transfer to|transfer from|to checking|to savings|from checking|from savings|autosave transfer|move money)/.test(
+      searchable,
+    )
+  ) {
+    return "transfer";
+  }
 
   if (amount > 0) {
     if (/(refund|reversal|return)/.test(searchable)) {
@@ -226,6 +257,10 @@ export function inferCategoryKind(transaction: ImportedTransactionLike) {
 
   if (type === "deposit" || type === "credit" || type === "refund") {
     return "income";
+  }
+
+  if (type === "transfer") {
+    return "expense";
   }
 
   return "expense";
