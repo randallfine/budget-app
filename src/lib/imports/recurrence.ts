@@ -1,5 +1,6 @@
 import {
   buildReadableImportedAccountName,
+  normalizeImportedAmount,
   normalizeImportedTransaction,
 } from "@/lib/imports/normalization";
 
@@ -55,15 +56,6 @@ type InstallmentProgress = {
   currentPayment: number;
   totalPayments: number;
 };
-
-function toNumber(value: number | string) {
-  if (typeof value === "number") {
-    return value;
-  }
-
-  const parsed = Number.parseFloat(value);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
 
 function parseDate(value: string) {
   return new Date(`${value}T00:00:00Z`);
@@ -229,11 +221,12 @@ export function findRecurringCandidates(
       sameAccountTransactions,
       existingAccounts,
     );
-    const amount = Math.abs(toNumber(transaction.amount));
+    const normalizedAmount = normalizeImportedAmount(transaction);
+    const amount = Math.abs(normalizedAmount);
     const key = [
       normalized.transactionName.toLowerCase(),
       readableAccountName.toLowerCase(),
-      Math.sign(toNumber(transaction.amount)),
+      Math.sign(normalizedAmount),
       amount.toFixed(2),
     ].join("|");
     const currentGroup = groupedTransactions.get(key) ?? [];
@@ -305,7 +298,7 @@ export function findRecurringCandidates(
       accountLabel: [normalized.institutionName, readableAccountName]
         .filter(Boolean)
         .join(" • "),
-      amount: toNumber(sortedGroup[sortedGroup.length - 1].amount),
+      amount: normalizeImportedAmount(sortedGroup[sortedGroup.length - 1]),
       occurrences: sortedGroup.length,
       firstSeenDate: sortedGroup[0].transaction_date,
       lastSeenDate: sortedGroup[sortedGroup.length - 1].transaction_date,

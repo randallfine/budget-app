@@ -161,6 +161,94 @@ export function canonicalizeForMatch(value: string | null | undefined) {
     .replace(/[^a-z0-9]+/g, "");
 }
 
+function splitMatchTokens(value: string | null | undefined) {
+  return normalizeWhitespace(value ?? "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .filter((token) => token.length > 1);
+}
+
+export function findClosestTransactionNameSuggestions(
+  rawName: string,
+  existingNames: string[] | null | undefined,
+  limit = 6,
+) {
+  const normalizedRawName = canonicalizeForMatch(rawName);
+  const rawTokens = new Set(splitMatchTokens(rawName));
+  const candidateNames = existingNames ?? [];
+
+  const ranked = candidateNames
+    .map((name) => {
+      const normalizedName = canonicalizeForMatch(name);
+
+      if (!normalizedName) {
+        return null;
+      }
+
+      let score = 0;
+
+      if (normalizedName === normalizedRawName) {
+        score += 100;
+      }
+
+      if (normalizedRawName && normalizedName.includes(normalizedRawName)) {
+        score += 35;
+      }
+
+      if (normalizedRawName && normalizedRawName.includes(normalizedName)) {
+        score += 30;
+      }
+
+      const candidateTokens = splitMatchTokens(name);
+      let overlappingTokens = 0;
+
+      for (const token of candidateTokens) {
+        if (rawTokens.has(token)) {
+          overlappingTokens += 1;
+        }
+      }
+
+      score += overlappingTokens * 12;
+
+      if (candidateTokens[0] && rawTokens.has(candidateTokens[0])) {
+        score += 8;
+      }
+
+      score -= Math.abs(normalizedName.length - normalizedRawName.length) * 0.2;
+
+      if (score <= 0) {
+        return null;
+      }
+
+      return {
+        name,
+        score,
+      };
+    })
+    .filter((candidate): candidate is { name: string; score: number } => candidate !== null)
+    .sort((left, right) => right.score - left.score || left.name.localeCompare(right.name));
+
+  const uniqueSuggestions: string[] = [];
+  const seen = new Set<string>();
+
+  for (const candidate of ranked) {
+    const key = canonicalizeForMatch(candidate.name);
+
+    if (!key || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    uniqueSuggestions.push(candidate.name);
+
+    if (uniqueSuggestions.length >= limit) {
+      break;
+    }
+  }
+
+  return uniqueSuggestions;
+}
+
 export function normalizeAccountType(value: string | null | undefined) {
   const normalized = normalizeWhitespace(value ?? "").toLowerCase();
 
@@ -195,6 +283,23 @@ export function normalizeAccountType(value: string | null | undefined) {
   return normalized.replace(/\s+/g, "_");
 }
 
+function buildTransactionSearchableText(transaction: ImportedTransactionLike) {
+  return [
+    transaction.category,
+    transaction.description,
+    transaction.custom_name,
+    transaction.merchant_name,
+    transaction.note,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+export function normalizeImportedAmount(transaction: ImportedTransactionLike) {
+  return toNumber(transaction.amount) * -1;
+}
+
 export function inferTransactionType(transaction: ImportedTransactionLike) {
   const reviewedType = normalizeWhitespace(transaction.reviewed_transaction_type ?? "").toLowerCase();
 
@@ -205,20 +310,11 @@ export function inferTransactionType(transaction: ImportedTransactionLike) {
     return reviewedType as TransactionTypeOption;
   }
 
-  const amount = toNumber(transaction.amount);
-  const searchable = [
-    transaction.category,
-    transaction.description,
-    transaction.custom_name,
-    transaction.merchant_name,
-    transaction.note,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
+  const amount = normalizeImportedAmount(transaction);
+  const searchable = buildTransactionSearchableText(transaction);
 
   if (
-    /(internal transfer|transfer to|transfer from|to checking|to savings|from checking|from savings|autosave transfer|move money)/.test(
+    /(internal transfer|transfer to|transfer from|to checking|to savings|from checking|from savings|autosave transfer|move money|online payment|payment from|payment to|credit card payment)/.test(
       searchable,
     )
   ) {

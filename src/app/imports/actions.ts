@@ -9,6 +9,7 @@ import {
   findMatchingAccount,
   findMatchingCategory,
   matchesImportedTransaction,
+  normalizeImportedAmount,
   normalizeImportedTransaction,
   requiresTransactionNameReview,
   transactionTypeOptions,
@@ -342,6 +343,7 @@ async function approveImportedTransactionById(
   }
 
   const normalized = normalizeImportedTransaction(importedTransaction);
+  const normalizedAmount = normalizeImportedAmount(importedTransaction);
   const [
     { data: accountData, error: accountsError },
     { data: categoryData, error: categoriesError },
@@ -438,13 +440,27 @@ async function approveImportedTransactionById(
     categories.push(category);
   }
 
-  const { data: existingTransactionData, error: existingTransactionsError } = await adminSupabase
+  const rawAmount =
+    typeof importedTransaction.amount === "number"
+      ? importedTransaction.amount
+      : Number.parseFloat(importedTransaction.amount);
+  const candidateAmounts = Array.from(
+    new Set([rawAmount, normalizedAmount].filter((value) => Number.isFinite(value))),
+  );
+
+  let existingTransactionsQuery = adminSupabase
     .from("transactions")
     .select("id, description, notes")
     .eq("household_id", householdId)
     .eq("account_id", account.id)
-    .eq("transaction_date", importedTransaction.transaction_date)
-    .eq("amount", importedTransaction.amount);
+    .eq("transaction_date", importedTransaction.transaction_date);
+
+  if (candidateAmounts.length > 0) {
+    existingTransactionsQuery = existingTransactionsQuery.in("amount", candidateAmounts);
+  }
+
+  const { data: existingTransactionData, error: existingTransactionsError } =
+    await existingTransactionsQuery;
 
   if (existingTransactionsError) {
     throw existingTransactionsError;
@@ -469,7 +485,7 @@ async function approveImportedTransactionById(
     household_id: householdId,
     account_id: account.id,
     category_id: category?.id ?? null,
-    amount: importedTransaction.amount,
+    amount: normalizedAmount,
     transaction_date: importedTransaction.transaction_date,
     description: normalized.transactionName,
     notes: buildTransactionNotes(importedTransaction, normalized),
@@ -608,7 +624,9 @@ export async function saveImportedTransactionNameReview(formData: FormData) {
     }
 
     revalidatePath("/imports");
-    redirect("/imports?name_reviewed=1");
+    redirect(
+      `/imports?name_reviewed=1#staged-transaction-${encodeURIComponent(importedTransactionId)}`,
+    );
   } catch (error) {
     unstable_rethrow(error);
     console.error("Imported transaction name review failed:", error);
@@ -648,7 +666,9 @@ export async function saveImportedTransactionTypeReview(formData: FormData) {
     }
 
     revalidatePath("/imports");
-    redirect("/imports?type_reviewed=1");
+    redirect(
+      `/imports?type_reviewed=1#staged-transaction-${encodeURIComponent(importedTransactionId)}`,
+    );
   } catch (error) {
     unstable_rethrow(error);
     console.error("Imported transaction type review failed:", error);

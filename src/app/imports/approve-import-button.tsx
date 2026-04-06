@@ -2,13 +2,17 @@
 
 import { useFormStatus } from "react-dom";
 
-export function ApproveImportButton() {
+type ApproveImportButtonProps = {
+  disabled?: boolean;
+};
+
+export function ApproveImportButton({ disabled = false }: ApproveImportButtonProps) {
   const { pending } = useFormStatus();
 
   return (
     <button
       type="submit"
-      disabled={pending}
+      disabled={disabled || pending}
       className="rounded-md bg-emerald-600 px-3 py-2 text-xs font-medium text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-emerald-400"
     >
       {pending ? "Approving..." : "Approve"}

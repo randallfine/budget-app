@@ -1,30 +1,12 @@
 import { redirect } from "next/navigation";
-import {
-  buildReadableImportedAccountName,
-  formatImportedDisplayLabel,
-  findMatchingAccount,
-  findMatchingCategory,
-  normalizeImportedTransaction,
-  requiresTransactionNameReview,
-  transactionTypeOptions,
-} from "@/lib/imports/normalization";
 import { findRecurringCandidates } from "@/lib/imports/recurrence";
 import { isAllowedUserEmail } from "@/lib/supabase/allowed-users";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 import { PageHeader } from "../(protected)/page-header";
-import {
-  approveImportedTransactionsBatch,
-  approveImportedTransaction,
-  createDefaultHousehold,
-  importRocketMoneyCsv,
-  saveImportedTransactionNameReview,
-  saveImportedTransactionTypeReview,
-} from "./actions";
-import { BatchApproveButton } from "./batch-approve-button";
+import { createDefaultHousehold, importRocketMoneyCsv } from "./actions";
 import { ImportSubmitButton } from "./import-submit-button";
-import { SaveReviewButton } from "./save-review-button";
-import { SaveTypeButton } from "./save-type-button";
+import { StagedTransactionsTable } from "./staged-transactions-table";
 
 type ImportedTransactionRow = {
   id: string;
@@ -56,6 +38,10 @@ type CategoryRow = {
   id: string;
   name: string;
   kind: string;
+};
+
+type TransactionNameRow = {
+  description: string | null;
 };
 
 function isMissingImportedTransactionsTableError(error: unknown) {
@@ -105,10 +91,6 @@ function formatCurrency(value: number) {
     style: "currency",
     currency: "USD",
   }).format(value);
-}
-
-function normalizeAmount(value: number | string) {
-  return typeof value === "number" ? value : Number.parseFloat(value);
 }
 
 type ImportsPageProps = {
@@ -179,6 +161,7 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
   let importedTransactions: ImportedTransactionRow[] = [];
   let accounts: AccountRow[] = [];
   let categories: CategoryRow[] = [];
+  let existingTransactionNames: string[] = [];
   let recurringCandidates: ReturnType<typeof findRecurringCandidates> = [];
   let loadError = false;
   let loadErrorMessage: string | undefined;
@@ -204,6 +187,7 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
         { data: importedData, error: importedError },
         { data: accountData, error: accountError },
         { data: categoryData, error: categoryError },
+        { data: transactionNameData, error: transactionNameError },
       ] = await Promise.all([
         adminSupabase
           .from("imported_transactions")
@@ -213,6 +197,7 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
           .eq("household_id", household.id)
           .order("transaction_date", { ascending: false })
           .order("created_at", { ascending: false })
+          .order("id", { ascending: false })
           .limit(250),
         adminSupabase
           .from("accounts")
@@ -222,6 +207,14 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
           .from("categories")
           .select("id, name, kind")
           .eq("household_id", household.id),
+        adminSupabase
+          .from("transactions")
+          .select("description")
+          .eq("household_id", household.id)
+          .not("description", "is", null)
+          .order("transaction_date", { ascending: false })
+          .order("created_at", { ascending: false })
+          .limit(1000),
       ]);
 
       if (importedError) {
@@ -236,9 +229,20 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
         throw categoryError;
       }
 
+      if (transactionNameError) {
+        throw transactionNameError;
+      }
+
       importedTransactions = (importedData ?? []) as ImportedTransactionRow[];
       accounts = (accountData ?? []) as AccountRow[];
       categories = (categoryData ?? []) as CategoryRow[];
+      existingTransactionNames = Array.from(
+        new Set(
+          ((transactionNameData ?? []) as TransactionNameRow[])
+            .map((transaction) => transaction.description?.trim() ?? "")
+            .filter(Boolean),
+        ),
+      );
       recurringCandidates = findRecurringCandidates(importedTransactions, accounts);
       importedTransactions = importedTransactions.slice(0, 25);
     }
@@ -252,13 +256,8 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
     console.error("Failed to load imported transactions:", error);
   }
 
-  const totalImportedAmount = importedTransactions.reduce((sum, transaction) => {
-    const amount = normalizeAmount(transaction.amount);
-    return Number.isFinite(amount) ? sum + amount : sum;
-  }, 0);
-
   return (
-    <main className="mx-auto w-full max-w-4xl flex-1 px-6 py-10">
+    <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-10">
       <PageHeader
         title="Imports"
         description="Upload a Rocket Money CSV and stage the rows in Supabase for review."
@@ -344,224 +343,20 @@ export default async function ImportsPage({ searchParams }: ImportsPageProps) {
       </section>
 
       <section className="mt-6 rounded-xl border border-zinc-200 p-6 dark:border-zinc-800">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h2 className="text-lg font-semibold">Staged Transactions</h2>
-            <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-              The 25 most recent rows currently staged in `imported_transactions`.
-            </p>
-          </div>
-          <div className="text-right">
-            <p className="text-xs text-zinc-500 dark:text-zinc-400">Visible staged total</p>
-            <p className="font-mono text-sm">{formatCurrency(totalImportedAmount)}</p>
-          </div>
-        </div>
-
         {loadError ? (
           <p className="mt-4 rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950/40 dark:text-rose-300">
             {loadErrorMessage ?? "We couldn&apos;t load the staged import rows right now."}
           </p>
         ) : null}
 
-        {!loadError && importedTransactions.length === 0 ? (
-          <p className="mt-4 text-sm text-zinc-600 dark:text-zinc-400">
-            No imported transactions have been staged yet.
-          </p>
-        ) : null}
-
-        {!loadError && importedTransactions.length > 0 ? (
-          <div className="mt-4 overflow-x-auto">
-            <form id={batchFormId} action={approveImportedTransactionsBatch} className="mb-3 flex items-center justify-between gap-3">
-              <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                Select staged rows with the checkboxes, then approve them together.
-              </p>
-              <BatchApproveButton />
-            </form>
-
-            <table className="w-full text-left text-sm">
-              <thead className="bg-zinc-50 dark:bg-zinc-900/60">
-                <tr>
-                  <th className="px-4 py-3 font-medium">Select</th>
-                  <th className="px-4 py-3 font-medium">Date</th>
-                  <th className="px-4 py-3 font-medium">Normalized Transaction</th>
-                  <th className="px-4 py-3 font-medium">Account</th>
-                  <th className="px-4 py-3 font-medium">Category</th>
-                  <th className="px-4 py-3 font-medium">Type</th>
-                  <th className="px-4 py-3 font-medium">Source</th>
-                  <th className="px-4 py-3 font-medium">Amount</th>
-                  <th className="px-4 py-3 font-medium text-right">Approve</th>
-                </tr>
-              </thead>
-              <tbody>
-                {importedTransactions.map((transaction) => {
-                  const amount = normalizeAmount(transaction.amount);
-                  const normalized = normalizeImportedTransaction(transaction);
-                  const needsNameReview = requiresTransactionNameReview(transaction);
-                  const similarImportedTransactions = importedTransactions.filter(
-                    (candidate) =>
-                      candidate.institution_name === transaction.institution_name &&
-                      candidate.account_name === transaction.account_name &&
-                      candidate.account_type === transaction.account_type,
-                  );
-                  const readableAccountName = buildReadableImportedAccountName(
-                    normalized,
-                    similarImportedTransactions,
-                    accounts,
-                  );
-                  const accountMatch = findMatchingAccount(accounts, normalized);
-                  const categoryMatch = findMatchingCategory(categories, normalized);
-                  const rawDisplayName =
-                    transaction.custom_name?.trim() || transaction.merchant_name;
-                  const accountLabel = [
-                    normalized.institutionName,
-                    readableAccountName,
-                  ]
-                    .filter(Boolean)
-                    .join(" • ");
-                  const categoryLabel = normalized.categoryName ?? "Uncategorized";
-                  const accountStatus = accountMatch
-                    ? "Matches existing account"
-                    : "Creates account on approval";
-                  const categoryStatus = normalized.categoryName
-                    ? categoryMatch
-                      ? "Matches existing category"
-                      : "Creates category on approval"
-                    : "Leaves transaction uncategorized";
-                  const reviewedNameValue =
-                    transaction.custom_name?.trim() || normalized.transactionName;
-
-                  return (
-                    <tr
-                      key={transaction.id}
-                      className="border-t border-zinc-200 dark:border-zinc-800"
-                    >
-                      <td className="px-4 py-3 align-top">
-                        <input
-                          type="checkbox"
-                          name="importedTransactionIds"
-                          value={transaction.id}
-                          form={batchFormId}
-                          disabled={needsNameReview}
-                          className="h-4 w-4 rounded border-zinc-300 text-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
-                        />
-                      </td>
-                      <td className="px-4 py-3 text-zinc-600 dark:text-zinc-400">
-                        {transaction.transaction_date}
-                      </td>
-                      <td className="px-4 py-3">
-                        <div>
-                          <p className="font-medium">{normalized.transactionName}</p>
-                          <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                            Raw: {formatImportedDisplayLabel(rawDisplayName)}
-                          </p>
-                          {transaction.description ? (
-                            <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                              Memo: {transaction.description}
-                            </p>
-                          ) : null}
-                          {needsNameReview ? (
-                            <div className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
-                              Please validate this transaction name mapping before approval.
-                            </div>
-                          ) : null}
-                          {needsNameReview ? (
-                            <form
-                              action={saveImportedTransactionNameReview}
-                              className="mt-2 flex flex-wrap items-center gap-2"
-                            >
-                              <input
-                                type="hidden"
-                                name="importedTransactionId"
-                                value={transaction.id}
-                              />
-                              <input
-                                type="text"
-                                name="reviewedName"
-                                defaultValue={reviewedNameValue}
-                                className="min-w-56 flex-1 rounded-md border border-zinc-300 bg-white px-3 py-2 text-xs dark:border-zinc-700 dark:bg-zinc-900"
-                              />
-                              <SaveReviewButton />
-                            </form>
-                          ) : null}
-                        </div>
-                      </td>
-                      <td className="px-4 py-3">
-                        <p className="text-zinc-600 dark:text-zinc-400">{accountLabel || "—"}</p>
-                        <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                          {accountStatus}
-                        </p>
-                      </td>
-                      <td className="px-4 py-3">
-                        <p className="text-zinc-600 dark:text-zinc-400">{categoryLabel}</p>
-                        <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                          {categoryStatus}
-                        </p>
-                      </td>
-                      <td className="px-4 py-3 text-zinc-600 capitalize dark:text-zinc-400">
-                        <div className="space-y-2">
-                          <p>{normalized.transactionType}</p>
-                          <form
-                            action={saveImportedTransactionTypeReview}
-                            className="flex flex-wrap items-center gap-2"
-                          >
-                            <input
-                              type="hidden"
-                              name="importedTransactionId"
-                              value={transaction.id}
-                            />
-                            <select
-                              name="reviewedTransactionType"
-                              defaultValue={normalized.transactionType}
-                              className="rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
-                            >
-                              {transactionTypeOptions.map((option) => (
-                                <option key={option} value={option}>
-                                  {option}
-                                </option>
-                              ))}
-                            </select>
-                            <SaveTypeButton />
-                          </form>
-                        </div>
-                      </td>
-                      <td className="px-4 py-3 text-zinc-600 dark:text-zinc-400">
-                        {transaction.source}
-                      </td>
-                      <td className="px-4 py-3 font-mono">
-                        <span
-                          className={
-                            amount >= 0
-                              ? "text-emerald-600 dark:text-emerald-400"
-                              : "text-zinc-900 dark:text-zinc-100"
-                          }
-                        >
-                          {formatCurrency(amount)}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        <form action={approveImportedTransaction}>
-                          <button
-                            type="submit"
-                            name="importedTransactionId"
-                            value={transaction.id}
-                            disabled={needsNameReview}
-                            className="rounded-md bg-emerald-600 px-3 py-2 text-xs font-medium text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-emerald-400"
-                          >
-                            Approve
-                          </button>
-                        </form>
-                        {needsNameReview ? (
-                          <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
-                            Approval is blocked until the name is reviewed.
-                          </p>
-                        ) : null}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+        {!loadError ? (
+          <StagedTransactionsTable
+            initialTransactions={importedTransactions}
+            accounts={accounts}
+            categories={categories}
+            existingTransactionNames={existingTransactionNames}
+            batchFormId={batchFormId}
+          />
         ) : null}
       </section>
 
